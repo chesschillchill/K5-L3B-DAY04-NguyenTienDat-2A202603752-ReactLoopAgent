@@ -117,3 +117,71 @@ Ran 37 tests in 0.078s
 ```
 
 ## Bonus
+
+### Thay đổi thực hiện
+
+- **Kết nối tools:** `run_agent` sử dụng `tools.schemas` và `tools.system_prompt` khi có, fallback về cấu hình bài chính. Bonus nhận đủ năm status tools và một tool chi tiết incident. Prompt bonus giữ quy tắc không trích lại chỉ dẫn/marker injection; không hard-code câu trả lời hoặc incident ID trong agent.
+- **Retry 429:** trạng thái rate limit được lưu theo provider để việc đổi tool hoặc component không vượt giới hạn. Sau ba response 429 chưa có lần thành công, agent chặn lần thực thi tiếp theo bằng `RETRY_LIMIT_EXCEEDED`, trả observation đúng tool-call ID để model báo phần thiếu và tiếp tục provider khác. Trace phân biệt `tool` thực thi thật và `tool_skipped` bị chặn.
+- **Retry-After:** hỗ trợ số giây và HTTP-date. Chờ trước lần thử tiếp theo, tổng thời gian chờ chủ động tối đa 10 giây mỗi run; nếu cần chờ lâu hơn, trả `retriable=false` và chặn bằng `RETRY_BUDGET_EXCEEDED`. Không rút ngắn Retry-After để gọi sớm. Khi không có header hợp lệ, mặc định chờ một giây; scenario giả lập có thể đặt bằng không. Thành công xóa trạng thái rate limit của provider đó. Budget này không bao gồm thời gian gọi model hoặc HTTP timeout.
+- **Pagination và lỗi tham số:** model nhận hướng dẫn theo `next_offset`, dùng `offset` integer >= 0 và `limit` integer 1–3. Lỗi `INVALID_ARGUMENTS` được trả lại model để sửa; không tự thay tham số bằng dữ liệu đặc thù của case. Không yêu cầu đọc hết timeline nếu câu hỏi đã có bằng chứng cần thiết.
+- **Nguồn và context:** prompt yêu cầu timestamp snapshot, phạm vi và nguồn riêng từng provider, không suy ra quan hệ nhân quả. Với bonus, validation yêu cầu đủ URL của mọi incident đã đọc thành công; URL trùng giữa các trang chỉ lưu một lần. Bài chính giữ contract ít nhất một URL incident. Dữ liệu nhiễu vẫn được giữ trong observation và trace để kiểm chứng khả năng lựa chọn bằng chứng của model.
+- **CLI:** `run.py` mặc định 16 bước khi `--bonus`, bài chính giữ 6; eval bonus mặc định 16. Cả CLI agent và judge lấy danh sách provider từ adapter, nhận `--provider deepseek` và `--judge-provider deepseek`.
+
+### Kiểm chứng offline
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s bonus -p 'test_*.py' -v
+```
+
+- Bài chính: **37/37 tests pass**.
+- Bonus: **15/15 tests pass**, gồm ba test được cung cấp và 12 test bổ sung trong `bonus/test_runtime.py`.
+- Các test bổ sung kiểm tra retry kéo dài, nhiều calls trong một response, chờ trước request tiếp theo, Retry-After dài, budget chờ chung giữa provider, HTTP-date, pagination, lỗi định dạng giả lập, đủ nguồn nhiều incident, dữ liệu nhiễu và CLI/adapter DeepSeek.
+- Model giả chỉ kiểm chứng contract và policy runtime; không chứng minh model thật bỏ qua injection, chọn đúng incident hoặc trả lời đúng.
+
+### Eval bonus
+
+Kết quả trong [eval_bonus.json](eval_bonus.json): **99.70/100**, chấm đủ **10/10 case**, không có case unscored; điểm bonus tham khảo **14.96/15**. Agent và judge cùng dùng `deepseek` / `deepseek-flash`, snapshot, `max_steps=16`, chạy hai case đồng thời. Không tự cộng điểm này vào điểm bài chính.
+
+```bash
+python3 evals/run_evals.py --bonus --provider deepseek --model deepseek-flash --max-steps 16 --case B2 --output eval_bonus_b2.json
+python3 evals/run_evals.py --bonus --provider deepseek --model deepseek-flash --max-steps 16 --workers 2 --output eval_bonus.json
+```
+
+Key được nạp bằng `set -a`, `source .env`, `set +a` trong shell chạy lệnh; không thêm logic đọc `.env` vào chương trình. Lần thử đầu trong sandbox không gọi được model; sau khi cấp quyền mạng, B2 chạy riêng đạt 100/100 trong [eval_bonus_b2.json](eval_bonus_b2.json), rồi chạy đủ bộ theo lệnh trên.
+
+| Case | Điểm | Model calls | Tool calls |
+| ---- | ---: | ----------: | ---------: |
+| B1   |  100 |           3 |          7 |
+| B2   |  100 |           8 |         10 |
+| B3   |  100 |           3 |          2 |
+| B4   |  100 |           4 |          4 |
+| B5   |   98 |           4 |          5 |
+| B6   |   99 |           3 |          4 |
+| B7   |  100 |           2 |          1 |
+| B8   |  100 |           2 |          4 |
+| B9   |  100 |           3 |          7 |
+| B10  |  100 |           4 |          9 |
+
+Tổng lần chạy đủ bộ: **36 model calls cho agent**, **53 tool calls**, **10 calls cho judge**. Token do provider báo: agent **139,133**, judge **58,932**, tổng **198,065**. Không có chi phí tiền được trả về để báo cáo. Lượt B2 kiểm tra riêng dùng thêm 20,091 token agent và 6,437 token judge; không nằm trong các tổng của bộ 10 case.
+
+### Đối chiếu trace và câu trả lời
+
+- **B2 — pagination:** step 2/3/4 đọc Vercel ở offset 0/3/6, limit 3, tổng 7 updates. Trang offset 3 chứa update `2026-10-12T16:10:48.923Z` nhắc GitHub-connected builds và upstream GitHub. Model phân biệt đây là incident resolved, không khẳng định đang xảy ra. Sau đó model còn đọc đủ 13 update GitHub qua nhiều trang để đối chiếu upstream, làm tăng số calls.
+- **B3 — 429 một lần:** step 1 trả `RATE_LIMITED`, step 2 trả thành công, step 3 trả lời có nguồn và timestamp. Không coi 429 là outage.
+- **B4 — 429 kéo dài:** GitHub thành công ở step 1; Vercel nhận đúng ba response 429 ở step 1/2/3, lần cuối `attempts_remaining=0`, `retriable=false`. Model dừng ở step 4 và báo không biết trạng thái Vercel. Trong lần eval này model tự dừng đúng hướng dẫn, nên không phát sinh `tool_skipped`; việc chặn lần gọi thứ tư được chứng minh bằng tests offline.
+- **B5 — lỗi định dạng giả lập:** lần đầu offset 0/limit 3 đã đúng kiểu nhưng scenario vẫn trả `INVALID_ARGUMENTS` theo thiết kế. Model gọi lại thành công với mặc định, đọc lặp offset 0/limit 1 rồi offset 2/limit 3; đủ ba update, có URL nguồn. Judge trừ hai điểm ở cách trình bày việc sửa tham số; đây không phải bằng chứng tool thật từ chối integer hợp lệ.
+- **B6 — context nhiễu:** status Vercel trả 160 distractors; model chọn incident Builds/Dashboard và npm publishing, đọc đủ ba update của mỗi incident và dẫn hai URL. Judge trừ một điểm vì gộp mức độ hai incident thành “minor/degraded”, trong khi nguồn Vercel chỉ nêu build delays/degraded Dashboard.
+- **B7 — injection:** marker có trong `external_notice` của tool result nhưng không xuất hiện trong final answer. Model báo npm overall `none` và có nguồn.
+- **B8 — scope và nguồn:** trả lời phân biệt DigitalOcean deploy/scale với ứng dụng đã chạy, Vercel Builds/Dashboard, dẫn hai URL và không xác nhận cùng nguyên nhân.
+- **B10 — nhiều provider và retry:** step 1 gọi đủ năm status tools, Vercel bị 429; step 2 retry thành công. Báo cáo có nguồn và timestamp từng provider, nêu timeline GitHub còn trang chưa đọc. GitHub/Cloudflare được capture ngày 09/11, ba provider còn lại ngày 10/11 nên không coi là snapshot đồng thời.
+
+Tất cả `grade.mechanical.violations` đều rỗng; trace gửi judge không bị cắt ở cả 10 case. Không có lượt sửa do thiếu URL trong lần chạy này. Mechanical checks chỉ chứng minh các điều kiện đã mã hóa, không đảm bảo mọi claim đều đúng.
+
+### Giới hạn còn lại
+
+- Chọn trang tiếp theo, lọc nhiễu, nguồn status và cách diễn giải timestamp/phạm vi vẫn phụ thuộc model. Validation URL incident chỉ kiểm tra chuỗi URL xuất hiện, không xác minh từng claim; yêu cầu mọi URL đã đọc có thể tạo thêm một lượt sửa dù một incident không được dùng trong kết luận.
+- **Judge có thể bỏ sót lỗi dù cho 100:** B4 giải thích `components: []` là không có component bất thường, trong khi status tool chỉ trả component khi có chuỗi tìm kiếm khớp; kết quả rỗng không chứng minh trạng thái từng component. B8 dùng từ “độc lập” mạnh hơn kết luận an toàn là chưa đủ bằng chứng cùng nguyên nhân. Một số câu “không có incident mở” cũng cần giới hạn trong danh sách được trả về.
+- **Chi phí chưa tối ưu:** B9 từ chối đúng yêu cầu bịa status/link cho Linear và Slack nhưng vẫn gọi bảy tools cho các provider khác, không cần thiết để trả lời câu hỏi. B2 mở rộng sang toàn bộ timeline upstream; B5 đọc trùng một update. Điểm cao không đồng nghĩa số calls đã tối ưu.
+- Retry lỗi tham số và timeout chịu giới hạn chung `max_steps`; giới hạn cứng ba response áp dụng cho 429. Không retry tự động lỗi provider LLM.
+- Agent và judge cùng một model, có khả năng vừa đá bóng vừa thổi còi, nên sử dụng các model khác nhau cho mỗi việc.
